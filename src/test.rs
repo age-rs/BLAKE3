@@ -809,6 +809,17 @@ const fn test_hash_const_conversions() {
     _ = hash.as_bytes();
 }
 
+#[test]
+fn test_block_buffer_alignment() {
+    // ChunkState.buf and Output.block are Aligned64 so that wide vector stores
+    // into them (e.g. from memcpy) can store-to-load forward regardless of
+    // stack layout. See the comment on Aligned64 in lib.rs, the measurements in
+    // https://github.com/zooko/bench-hashes/issues/2, and the before/after
+    // benchmarks in https://github.com/BLAKE3-team/BLAKE3/pull/582.
+    assert_eq!(64, core::mem::align_of::<crate::Aligned64>());
+    assert_eq!(0, core::mem::offset_of!(crate::Aligned64, 0));
+}
+
 #[cfg(feature = "zeroize")]
 #[test]
 fn test_zeroize() {
@@ -822,7 +833,7 @@ fn test_zeroize() {
         chunk_state: crate::ChunkState {
             cv: [42; 8],
             chunk_counter: 42,
-            buf: [42; 64],
+            buf: crate::Aligned64([42; 64]),
             buf_len: 42,
             blocks_compressed: 42,
             flags: 42,
@@ -850,7 +861,7 @@ fn test_zeroize() {
     let mut output_reader = crate::OutputReader {
         inner: crate::Output {
             input_chaining_value: [42; 8],
-            block: [42; 64],
+            block: crate::Aligned64([42; 64]),
             counter: 42,
             block_len: 42,
             flags: 42,

@@ -142,6 +142,7 @@ mod join;
 use arrayvec::{ArrayString, ArrayVec};
 use core::cmp;
 use core::fmt;
+use core::ops::{Deref, DerefMut};
 use platform::{MAX_SIMD_DEGREE, MAX_SIMD_DEGREE_OR_2, Platform};
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
@@ -429,13 +430,57 @@ impl fmt::Display for HexError {
 #[cfg(feature = "std")]
 impl std::error::Error for HexError {}
 
+// A 64-byte block of compression function input, with 64-byte alignment. This
+// is the type of ChunkState.buf and Output.block. glibc's AVX-512 memcpy
+// writes a 64-byte copy with a pair of overlapping unaligned 64-byte vector
+// stores, and the immediate reload of the destination then fails
+// store-to-load forwarding whenever the stack frame leaves it misaligned
+// (address & 31 != 0). Stack layout decides which case each process gets, so
+// the same binary hashes 64-byte inputs 35-45% slower in some processes than
+// in others (measured on Zen 5). Aligning ChunkState.buf pins every process
+// to the forwarding-friendly case, and Output.block gets the same alignment
+// so that its residue is pinned as well, rather than frozen at whatever spot
+// the realigned frame happens to give it. Measurements are in
+// https://github.com/zooko/bench-hashes/issues/2 and
+// https://github.com/BLAKE3-team/BLAKE3/pull/582.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(align(64))]
+struct Aligned64([u8; BLOCK_LEN]);
+
+impl Deref for Aligned64 {
+    type Target = [u8; BLOCK_LEN];
+
+    fn deref(&self) -> &[u8; BLOCK_LEN] {
+        &self.0
+    }
+}
+
+impl DerefMut for Aligned64 {
+    fn deref_mut(&mut self) -> &mut [u8; BLOCK_LEN] {
+        &mut self.0
+    }
+}
+
+impl PartialEq<[u8; BLOCK_LEN]> for Aligned64 {
+    fn eq(&self, other: &[u8; BLOCK_LEN]) -> bool {
+        self.0 == *other
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Zeroize for Aligned64 {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 // Each chunk or parent node can produce either a 32-byte chaining value or, by
 // setting the ROOT flag, any number of final output bytes. The Output struct
 // captures the state just prior to choosing between those two possibilities.
 #[derive(Clone)]
 struct Output {
     input_chaining_value: CVWords,
-    block: [u8; 64],
+    block: Aligned64,
     block_len: u8,
     counter: u64,
     flags: u8,
@@ -499,7 +544,7 @@ impl Zeroize for Output {
 struct ChunkState {
     cv: CVWords,
     chunk_counter: u64,
-    buf: [u8; BLOCK_LEN],
+    buf: Aligned64,
     buf_len: u8,
     blocks_compressed: u8,
     flags: u8,
@@ -511,7 +556,7 @@ impl ChunkState {
         Self {
             cv: *key,
             chunk_counter,
-            buf: [0; BLOCK_LEN],
+            buf: Aligned64([0; BLOCK_LEN]),
             buf_len: 0,
             blocks_compressed: 0,
             flags,
@@ -555,7 +600,7 @@ impl ChunkState {
                     block_flags,
                 );
                 self.buf_len = 0;
-                self.buf = [0; BLOCK_LEN];
+                self.buf = Aligned64([0; BLOCK_LEN]);
                 self.blocks_compressed += 1;
             }
         }
@@ -890,7 +935,9 @@ fn hash_all_at_once<J: join::Join>(input: &[u8], key: &CVWords, flags: u8) -> Ou
     // compress_subtree_to_parent_node().
     Output {
         input_chaining_value: *key,
-        block: compress_subtree_to_parent_node::<J>(input, key, 0, flags, platform),
+        block: Aligned64(compress_subtree_to_parent_node::<J>(
+            input, key, 0, flags, platform,
+        )),
         block_len: BLOCK_LEN as u8,
         counter: 0,
         flags: flags | PARENT,
@@ -1015,7 +1062,7 @@ fn parent_node_output(
     flags: u8,
     platform: Platform,
 ) -> Output {
-    let mut block = [0; BLOCK_LEN];
+    let mut block = Aligned64([0; BLOCK_LEN]);
     block[..32].copy_from_slice(left_child);
     block[32..].copy_from_slice(right_child);
     Output {
